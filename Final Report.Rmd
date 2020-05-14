@@ -1,0 +1,351 @@
+---
+title: "QAC 386 Final Project"
+author: "Griffin Barich"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+```{r setup, echo=F, message=F, warning=F}
+library(tidyverse)
+library(caret)
+library(ROCR)
+load("nb_prds.rdata")
+
+knitr::opts_chunk$set(echo=F)
+```
+
+
+```{r, message=F, echo=F}
+myROC <- function(predictions, actual, cutoffs = seq(0, 1, by = .05)) {
+  pred <- ROCR::prediction(predictions, actual)
+  perf <- performance(pred, "tpr", "fpr")
+  plot(perf,
+    main = "ROC Curve with Cutoffs",
+    colorize = FALSE,
+    print.cutoffs.at = cutoffs,
+    text.adj = c(1.5, 1),
+    text.cex = .6,
+    xlab = "1 - Specificity (False Positive Rate)",
+    ylab = "Sensitivity (True Positive Rate)"
+  )
+  abline(a = 0, b = 1)
+  abline(h = seq(0, 1, by = .1), lty = 3, col = "lightgrey")
+  abline(v = seq(0, 1, by = .1), lty = 3, col = "lightgrey")
+
+  # optimal cutpoint (sensitivity and specificity equally important)
+  cost <- performance(pred, "cost")
+  k <- which.min(cost@y.values[[1]])
+  cut <- pred@cutoffs[[1]][k]
+  sens <- pred@tp[[1]][k] / pred@n.pos[[1]]
+  spec <- pred@tn[[1]][k] / pred@n.neg[[1]]
+  hitrate <- (pred@tp[[1]][k] +
+    pred@tn[[1]][k]) /
+    length(predictions)
+  text(.8, .3, paste("optimal cutpoint=", round(cut, 2)))
+  text(.8, .25, paste("sensitivity=", round(sens, 2)))
+  text(.8, .2, paste("specificity=", round(spec, 2)))
+  text(.8, .15, paste("hit rate=", round(hitrate, 2)))
+  points(1 - spec, sens, col = "red", pch = 19)
+  }
+```
+
+
+## Project Overview
+
+In _QAC 385_, Elizaveta Kravchenko and I worked together on a text classification project in which we tried different machine learning algorithms to classify whether a quora question was insincere. That report went  into much more detail on the purpose and aims of the project which can be found [here]("QAC385Report.html"). This project aims to use the text processing methods from _QAC 386_ to augment the dataset and possibly improve the results that I had gained previously.
+
+
+## General Idea
+
+Using web scraping, organizations have made collections of word embeddings which is essentially a dimensionality-reduced space of words in a given dictionary. Depending on the dataset that was used for scraping, different words will show up in different dimensions. One goal of this is to allow vector addition of words for example `king - man + woman = queen`. This also allows text datasets in machine learning to be transformed into numeric datasets instead of dummy-coding words or using techniques like TF-IDF since these techniques can lead to incredibly high dimensional data (1000+ features). Using the _wordVectors_ package, I will test different embeddings to see if I am able to train a better model than without the embeddings.
+
+
+## Testing Different Embeddings
+
+### Embeddings Used
+
++ Common Crawl Vectors from [fasttext.cc](https://fasttext.cc/docs/en/english-vectors.html): 2 Million Word Vectors, 300 Dimensions, 600B Tokens
+
++  Wikipedia and Gigaword Vectors from [GloVe](https://nlp.stanford.edu/projects/glove/): 
+400K Word Vectors, 50 and 200 Dimensions, 6B Tokens
+
++ Common Crawl Vectors from [GloVe](https://nlp.stanford.edu/projects/glove/): 
+2 Million Word Vectors, 300 Dimensions, 840B Tokens
+
++ Twitter Vectors from [GloVe](https://nlp.stanford.edu/projects/glove/): 
+1.2 Million Word Vectors, 50 and 100 Dimensions, 27B Tokens
+
+
+### Methods
+
+Each embedding was read in using _wordVectors_ and joined to unnested Quora questions. Each question became the vector sum of the words in the question based on the Embedding, giving 6 training datasets. Then each dataset went through a machine learning pipeline using the _caret_ package: 
+
++ The data was split 70% / 30% into training and testing sets using the random seed 42.
+
++ Before Training, features with near zero variance were removed, the data was standardized, and default Principle Component Analysis is applied (this is to save time on training).
+
++ A Random Forest model (using _e1071_ and _randomforest_) is trained with 3 Fold Cross Validation and SMOTE resampling (upsamples rare events and downsamples common events). The cost function optimized for ROC score.
+
+### Results
+
+```{r, echo=F, message=F}
+load("trained_models.rda")
+names(trained_models) <- c("CC_FastText", "Wiki_200d", "Wiki_50d", "CC_GloVe", "Twitter_100d", "Twitter_50d")
+library(pROC)
+pROCs<- lapply(trained_models, function(x) (roc(response=x$probs$target,predictor=x$probs$X1)))
+ROCs <- sapply(pROCs, function(x) x$auc) %>% data.frame()
+ROCs$auc <- ROCs$.
+ROCs$. <- NULL
+ROCs$vec <- c("CC_FastText", "Wiki_200d", "Wiki_50d", "CC_GloVe", "Twitter_100d", "Twitter_50d")
+ROCs %>% arrange(desc(auc)) %>% select(vec, auc) %>% rename(Vector=vec, AUC=auc) %>% knitr::kable()
+```
+
+
+We can see that the Common Crawl datasets perform the best. This is likely due to having the largest amount of words and the largest amount of dimensions. The ROC curve and AUC for the FastText model is below.
+
+```{r, message=F, echo=F}
+myROC(predictions = trained_models[["CC_FastText"]]$probs$X1, 
+      actual = trained_models[["CC_FastText"]]$probs$target)
+
+roc(response = trained_models[["CC_FastText"]]$probs$target, 
+    predictor = trained_models[["CC_FastText"]]$probs$X1)$auc
+```
+
+Comparing this to the Naïve Bayes model trained on a binary term matrix (ROC curve and AUC below):
+
+```{r, message=F, echo=F}
+myROC(prob_nb$predicted, prob_nb$actual)
+
+roc(response = prob_nb$actual, predictor = prob_nb$predicted)$auc
+```
+
+Comparing the two confusion matricies (cut points were chosen from performance function in the _ROCR_ package):
+
+```{r, out.width="50%"}
+prob_nb$class <- ifelse(prob_nb$predicted >0.19, 1,0)
+prob_rf <- trained_models[["CC_FastText"]]$probs
+prob_rf$class <- ifelse(prob_rf$X1>0.23, "X1","X0")
+
+confusionMatrix(reference=factor(prob_nb$actual),data = factor(prob_nb$class),positive = "1")$table %>% fourfoldplot(color = c("red","green"), main="No Word Vectors")
+confusionMatrix(reference=factor(prob_rf$target),data = factor(prob_rf$class),positive = "X1")$table %>% fourfoldplot(color = c("red","green"), main="With Word Vectors")
+```
+
+
+#### Confusion Matrix without Word Vectors
+```{r}
+confusionMatrix(reference=factor(prob_nb$actual),data = factor(prob_nb$class),positive = "1")
+```
+
+#### Confustion Matrix with Word Vectors
+```{r}
+confusionMatrix(reference=factor(prob_rf$target),data = factor(prob_rf$class),positive = "X1")
+```
+
+
+### Conclusions
+
+Using the word vectors, it is hard to say that the word vectors add a lot to the model. The largest component of the improvement is in speed. The Naive Bayes model took many days to run, due to high dimensionality (1000+), while the random forest models only had 300 (less after PCA) dimensions to split on and so only took a few hours even with 10 times as much data. We also see from the ROC curve that the probabilities from the Embeddings model better correspond with how sure the model is of a positive. This is shown by the wider spacing of points on the ROC curve. This led to the better sensitivity of the model with the Word Vectors. Naive Bayes also is specifically suited to text mining, while Random Forest (chosen due to ease of parallelizing) does worse with higher dimensional data. 
+
+Within the word vectors, it is unsurprising that the datasets were ordered the way they were. Common Crawl captures all the different use of language on the internet while Twitter and Wikipedia likely have some dialect differences: Twitter with informalities and Wikipedia with academic language. The datasets are also about in order with respect to complexity (tokens), and the best scoring embeddings had the highest dimensionality. Still, the differences were very slight and could simply be due to randomness. 
+
+To further improve this project I could include: 
+
++ Testing other machine learning algorithms like Support Vector Machines or a Boosted Tree Algorithm
+
++ Tuning the models using more robust resampling (repeated cross validation) and more hyper parameter options
+
++ Adding more data that was kept aside for training time purposes
+
+## References
+
+Jeffrey Pennington, Richard Socher, and Christopher D. Manning. 2014. GloVe: Global Vectors for Word Representation.
+
+T. Mikolov, E. Grave, P. Bojanowski, C. Puhrsch, A. Joulin. Advances in Pre-Training Distributed Word Representations
+
+
+## Appendix
+
+### All Code (not run)
+
+#### Load Packages and Data
+```{r, eval=F, echo=T}
+library(wordVectors)
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(caret)
+
+tryCatch(df2 <- read_csv("train.csv"), finally=load("all_data.rda"))
+
+set.seed(42)
+df <- df2[sample(x = 1:nrow(df2), 100000),]
+
+prop <- prop.table(table(df$target))
+
+df %>% 
+  unnest_tokens(input=question_text, output =token, token="words") %>% 
+  anti_join(stop_words, by=c("token"="word")) %>% 
+  mutate(qid = paste0("doc_", qid)) -> df_unnested
+
+save(df_unnested, file="df_unnested.rda") 
+load("df_unnested.rda")
+
+vectorFiles <- list.files(path="Embeddings", full.names=TRUE, recursive=FALSE)
+```
+
+
+#### Create Training Sets
+```{r, eval=F, echo=T}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores()-4)
+registerDoParallel(cl)
+
+training_sets <- parLapply(cl=cl, X= vectorFiles, fun = function(rFile) {
+  library(wordVectors)
+  library(tidyverse)
+  library(tidytext)
+  library(tm)
+  library(caret)
+  
+  r <- wordVectors::read.vectors(filename=rFile, binary=F, sep=" ")
+  load("df_unnested.rda")
+  
+  d <- r[[df_unnested$token, average=F]]%>% 
+    data.frame()
+  d$token <- rownames(d)
+  
+  df_unnested %>% 
+    left_join(d) -> df_vec
+  
+  df_vec <- df_vec %>% 
+    group_by(qid, target) %>%
+    select(-token) %>% 
+    summarise_all(sum, na.rm=T) %>% 
+    ungroup() %>% 
+    select(-qid)
+  
+  set.seed(42)
+  index <- createDataPartition(y = df_vec$target, p=0.7, list=FALSE)
+  train <- df_vec[index,]
+  test <- df_vec[-index,]
+  
+  return(list(vFile = rFile, train=train, test=test))
+})
+stopCluster(cl)
+stopImplicitCluster()
+
+names(training_sets) <- vectorFiles
+
+save(training_sets, file="training_sets.rda")
+
+```
+
+#### Train Models on Each Set
+```{r, eval=F, echo=T}
+trained_models <- lapply(X = training_sets, function(x) {
+  train <- x[[2]]
+  train$target %>% factor(labels=c("X0", "X1")) -> train$target
+  test <- x[[3]]
+  test$target %>% factor(labels=c("X0", "X1")) -> test$target
+  prop <- prop.table(table(train$target))
+  library(doParallel)
+  library(wordVectors)
+  library(tidyverse)
+  library(tidytext)
+  library(tm)
+  library(caret)
+  cl <- makePSOCKcluster(detectCores()-4)
+  registerDoParallel(cl)
+  
+  tc <- trainControl(method = "cv", number = 3,
+                     classProbs = TRUE, summaryFunction = twoClassSummary,
+                     sampling = "smote", allowParallel = T, savePredictions = T)
+  
+  set.seed(42)
+  fit <- train(target ~ ., data=train, 
+                  method='parRF',
+                  trControl=tc, 
+                  preProcess= c("center", "scale", "pca", "nzv"),
+               metric="ROC")
+  
+  probs <- predict(fit, newdata = test[-1], type="prob")
+  probs$target <- test$target
+  
+  return(list(fit=fit, probs=probs))})
+
+names(trained_models) <- c("CC_FastText", "Wiki_200d", "Wiki_50d", "CC_GloVe", "Twitter_100d", "Twitter_50d")
+
+```
+
+
+#### Evaluate Models based on ROC and Confusion Matricies
+```{r, eval=F, echo=T}
+cl <- makePSOCKcluster(detectCores()-4)
+registerDoParallel(cl)
+
+cm_models <- foreach (i = 1:length(trained_models)) %dopar% {
+  library(caret)
+  probs <- trained_models[[i]]$probs
+  probs$targetn <- as.numeric(factor(probs$target)) - 1
+  ROC <- myROC(predictions = probs$X1, actual = probs$targetn)
+
+  classes_Sens <- ifelse(probs$X1>ROC["Sens"], "X1", "X0")
+  cm_Sens <- confusionMatrix(reference=factor(probs$target), data=factor(classes_Sens), positive = "X1", prevalence = prop[2])
+
+  classes_Opt <- ifelse(probs$X1>ROC["Opt_Cut"], "X1", "X0")
+  cm_Opt <- confusionMatrix(reference=factor(probs$target), data=factor(classes_Opt), positive = "X1", prevalence = prop[2])
+  fit <- trained_models[[i]]$fit
+  return(list(rf_Obj=fit, cm_Sens=cm_Sens, cm_Opt=cm_Opt, ROC=fit$results$ROC))
+}
+
+stopCluster(cl)
+stopImplicitCluster()
+
+names(trained_models) <- c("CC_FastText", "Wiki_200d", "Wiki_50d", "CC_GloVe", "Twitter_100d", "Twitter_50d")
+library(pROC)
+pROCs<- lapply(trained_models, function(x) (roc(response=x$probs$target,predictor=x$probs$X1)))
+ROCs <- sapply(pROCs, function(x) x$auc) %>% data.frame()
+ROCs$auc <- ROCs$.
+ROCs$. <- NULL
+ROCs$vec <- c("CC_FastText", "Wiki_200d", "Wiki_50d", "CC_GloVe", "Twitter_100d", "Twitter_50d")
+#ROCs is the table above
+```
+
+#### ROC Curve Code (From Prof. Kabacoff)
+```{r, eval=F, echo=T}
+myROC <- function(predictions, actual, cutoffs = seq(0, 1, by = .05)) {
+  pred <- ROCR::prediction(predictions, actual)
+  perf <- performance(pred, "tpr", "fpr")
+  plot(perf,
+    main = "ROC Curve with Cutoffs",
+    colorize = FALSE,
+    print.cutoffs.at = cutoffs,
+    text.adj = c(1.5, 1),
+    text.cex = .6,
+    xlab = "1 - Specificity (False Positive Rate)",
+    ylab = "Sensitivity (True Positive Rate)"
+  )
+  abline(a = 0, b = 1)
+  abline(h = seq(0, 1, by = .1), lty = 3, col = "lightgrey")
+  abline(v = seq(0, 1, by = .1), lty = 3, col = "lightgrey")
+
+  # optimal cutpoint (sensitivity and specificity equally important)
+  cost <- performance(pred, "cost")
+  k <- which.min(cost@y.values[[1]])
+  cut <- pred@cutoffs[[1]][k]
+  sens <- pred@tp[[1]][k] / pred@n.pos[[1]]
+  spec <- pred@tn[[1]][k] / pred@n.neg[[1]]
+  hitrate <- (pred@tp[[1]][k] +
+    pred@tn[[1]][k]) /
+    length(predictions)
+  text(.8, .3, paste("optimal cutpoint=", round(cut, 2)))
+  text(.8, .25, paste("sensitivity=", round(sens, 2)))
+  text(.8, .2, paste("specificity=", round(spec, 2)))
+  text(.8, .15, paste("hit rate=", round(hitrate, 2)))
+  points(1 - spec, sens, col = "red", pch = 19)
+  }
+```
+
+
